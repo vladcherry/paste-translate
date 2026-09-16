@@ -1,6 +1,10 @@
 #define _WIN32_WINNT 0x0600
+#ifndef UNICODE
 #define UNICODE
+#endif
+#ifndef _UNICODE
 #define _UNICODE
+#endif
 #include <windows.h>
 #include <winhttp.h>
 #include <shellapi.h>
@@ -24,12 +28,15 @@
 #define ID_PROGRESS 1008
 #define ID_BTN_REVERSE 1009
 #define ID_CHECK_AUTOPASTE 1010
+#define ID_COMBO_PROVIDER 1011
+#define ID_BTN_PASTE 1012
 
 #define WM_TRAYICON (WM_APP + 1)
 #define WM_TRANSLATE_DONE (WM_APP + 200)
 #define ID_TRAY_OPEN  2001
 #define ID_TRAY_KEY   2002
 #define ID_TRAY_EXIT  2003
+#define ID_TRAY_KEY_GEMINI 2004
 
 #define HOTKEY_TIMEOUT_MS 400
 #define MUTEX_NAME L"PasteTranslate_SingleInstance_Mutex_9F3D2A1B"
@@ -43,12 +50,20 @@ HWND g_hComboLabel = NULL;
 HWND g_hSourceCombo = NULL;
 HWND g_hTopmostCheck = NULL;
 HWND g_hAutoPasteCheck = NULL;
+HWND g_hBtnPaste = NULL;
 HWND g_hProgress = NULL;
 BOOL g_translating = FALSE;
 WCHAR g_lastSlavicLang[64] = L"Russian";
+// Target for an automatic paste right after a hotkey-triggered translation.
+// Deliberately cleared on manual Translate/Reverse so those never paste anywhere.
 HWND g_hPrevForegroundWindow = NULL;
+// Last window that held focus before ours, tracked continuously via WM_ACTIVATE.
+// This is what the manual Paste button aims at, so it works even when the window
+// was opened from the tray rather than by the hotkey.
+HWND g_hLastForegroundWindow = NULL;
 NOTIFYICONDATAW g_nid;
 HHOOK g_hKeyboardHook = NULL;
+HWINEVENTHOOK g_hForegroundHook = NULL;
 DWORD g_lastCtrlC = 0;
 BOOL g_ctrlDown = FALSE;
 WCHAR g_apiKey[256] = L"";
@@ -56,36 +71,109 @@ WCHAR g_configPath[MAX_PATH];
 WCHAR g_settingsPath[MAX_PATH];
 WCHAR g_exeDir[MAX_PATH];
 
+// ---------- DeepL provider state ----------
+WCHAR g_deeplKey[256] = L"";
+WCHAR g_deeplConfigPath[MAX_PATH];
+HWND g_hProviderCombo = NULL;
+HWND g_hProviderLabel = NULL;
+
+// ---------- Layout metrics ----------
+HFONT g_hFont = NULL;
+HWND g_hSrcLangLabel = NULL;
+int g_dpi = 96;
+int g_minWinW = 560;
+int g_minWinH = 470;
+
 // ---------- Persisted settings (loaded before the window exists, applied after) ----------
 WCHAR g_savedSourceLang[64] = L"Auto-detect";
 WCHAR g_savedTargetLang[64] = L"English";
 BOOL g_savedAlwaysOnTop = FALSE;
 BOOL g_savedAutoPaste = FALSE;
+WCHAR g_savedProvider[32] = L"DeepL";
 int g_savedWinX = CW_USEDEFAULT, g_savedWinY = CW_USEDEFAULT, g_savedWinW = 600, g_savedWinH = 520;
 
 // ---------- Forward declarations ----------
 void GetLangText(WCHAR* buf, int bufSize);
 void GetSourceLangText(WCHAR* buf, int bufSize);
+void GetProviderText(WCHAR* buf, int bufSize);
+
+// ---------- DPI + text measurement helpers ----------
+// Every hardcoded offset below goes through Scale(), and every label width is
+// measured with the actual font, so nothing can overlap at non-100% scaling.
+static int Scale(int v) {
+    return MulDiv(v, g_dpi, 96);
+}
+
+static void InitDpi(HWND hwnd) {
+    g_dpi = 96;
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (user32) {
+        typedef UINT (WINAPI *GetDpiForWindowFn)(HWND);
+        GetDpiForWindowFn getDpiForWindow =
+            (GetDpiForWindowFn)(void*)GetProcAddress(user32, "GetDpiForWindow");
+        if (getDpiForWindow) {
+            UINT dpi = getDpiForWindow(hwnd);
+            if (dpi >= 72 && dpi <= 480) {
+                g_dpi = (int)dpi;
+                return;
+            }
+        }
+    }
+    // Pre-Windows-10 fallback: system-wide DPI.
+    HDC hdc = GetDC(NULL);
+    if (hdc) {
+        int dpi = GetDeviceCaps(hdc, LOGPIXELSY);
+        ReleaseDC(NULL, hdc);
+        if (dpi >= 72) g_dpi = dpi;
+    }
+}
+
+static int MeasureTextWidth(const WCHAR* text) {
+    HDC hdc = GetDC(g_hMain);
+    if (!hdc) return 0;
+    HFONT oldFont = g_hFont ? (HFONT)SelectObject(hdc, g_hFont) : NULL;
+    SIZE size = {0, 0};
+    GetTextExtentPoint32W(hdc, text, (int)wcslen(text), &size);
+    if (oldFont) SelectObject(hdc, oldFont);
+    ReleaseDC(g_hMain, hdc);
+    return (int)size.cx;
+}
+
+// Width of a control's own caption, as actually rendered.
+static int MeasureCaptionWidth(HWND hwnd) {
+    WCHAR buf[256] = L"";
+    GetWindowTextW(hwnd, buf, 256);
+    return MeasureTextWidth(buf);
+}
+
+// A CBS_DROPDOWNLIST combo ignores the height passed to MoveWindow for its closed
+// state (that height sizes the drop-down list), so read back what it actually is.
+static int ComboClosedHeight(HWND combo) {
+    RECT rc;
+    GetWindowRect(combo, &rc);
+    return (int)(rc.bottom - rc.top);
+}
 
 // ---------- Utility: config file (plain text next to exe) ----------
-void LoadApiKey() {
-    FILE* f = _wfopen(g_configPath, L"r, ccs=UTF-8");
+static void LoadKeyFile(const WCHAR* path, WCHAR* dest, int destSize) {
+    dest[0] = 0;
+    FILE* f = _wfopen(path, L"r, ccs=UTF-8");
     if (f) {
-        fgetws(g_apiKey, 256, f);
-        // strip newline
-        size_t len = wcslen(g_apiKey);
-        while (len > 0 && (g_apiKey[len-1] == L'\n' || g_apiKey[len-1] == L'\r')) {
-            g_apiKey[--len] = 0;
+        if (fgetws(dest, destSize, f)) {
+            size_t len = wcslen(dest);
+            while (len > 0 && (dest[len-1] == L'\n' || dest[len-1] == L'\r')) {
+                dest[--len] = 0;
+            }
         }
         fclose(f);
     }
 }
 
-void SaveApiKey(const WCHAR* key) {
+static void SaveKeyFile(const WCHAR* path, const WCHAR* key, WCHAR* dest, int destSize) {
     WCHAR trimmed[256];
     wcsncpy(trimmed, key, 255);
     trimmed[255] = 0;
-    // Обрезаем пробелы и переносы строк по краям
+    // Trim surrounding whitespace and newlines
     size_t start = 0;
     while (trimmed[start] == L' ' || trimmed[start] == L'\t' || trimmed[start] == L'\r' || trimmed[start] == L'\n') start++;
     size_t end = wcslen(trimmed);
@@ -93,12 +181,18 @@ void SaveApiKey(const WCHAR* key) {
     trimmed[end] = 0;
     WCHAR* cleanKey = trimmed + start;
 
-    FILE* f = _wfopen(g_configPath, L"w, ccs=UTF-8");
+    FILE* f = _wfopen(path, L"w, ccs=UTF-8");
     if (f) {
         fputws(cleanKey, f);
         fclose(f);
     }
-    wcsncpy(g_apiKey, cleanKey, 255);
+    wcsncpy(dest, cleanKey, destSize - 1);
+    dest[destSize - 1] = 0;
+}
+
+void LoadApiKeys() {
+    LoadKeyFile(g_configPath, g_apiKey, 256);
+    LoadKeyFile(g_deeplConfigPath, g_deeplKey, 256);
 }
 
 // ---------- Settings file (key=value lines, plain text next to exe) ----------
@@ -118,6 +212,7 @@ void LoadSettings() {
         else if (wcscmp(key, L"TargetLang") == 0) wcsncpy(g_savedTargetLang, val, 63);
         else if (wcscmp(key, L"AlwaysOnTop") == 0) g_savedAlwaysOnTop = (wcscmp(val, L"1") == 0);
         else if (wcscmp(key, L"AutoPaste") == 0) g_savedAutoPaste = (wcscmp(val, L"1") == 0);
+        else if (wcscmp(key, L"Provider") == 0) wcsncpy(g_savedProvider, val, 31);
         else if (wcscmp(key, L"LastSlavicLang") == 0) wcsncpy(g_lastSlavicLang, val, 63);
         else if (wcscmp(key, L"WinX") == 0) g_savedWinX = _wtoi(val);
         else if (wcscmp(key, L"WinY") == 0) g_savedWinY = _wtoi(val);
@@ -142,6 +237,11 @@ void SaveSettings(HWND hwnd) {
         fwprintf(f, L"TargetLang=%ls\n", tgtLang);
         fwprintf(f, L"AlwaysOnTop=%d\n", alwaysOnTop ? 1 : 0);
         fwprintf(f, L"AutoPaste=%d\n", autoPaste ? 1 : 0);
+        {
+            WCHAR provider[32] = L"";
+            GetProviderText(provider, 32);
+            fwprintf(f, L"Provider=%ls\n", provider);
+        }
         fwprintf(f, L"LastSlavicLang=%ls\n", g_lastSlavicLang);
         fwprintf(f, L"WinX=%d\n", (int)rc.left);
         fwprintf(f, L"WinY=%d\n", (int)rc.top);
@@ -149,6 +249,55 @@ void SaveSettings(HWND hwnd) {
         fwprintf(f, L"WinH=%d\n", (int)(rc.bottom - rc.top));
         fclose(f);
     }
+}
+
+// ---------- Track the last foreground window that is not ours ----------
+// WM_ACTIVATE cannot do this job: its lParam only carries the other window's
+// handle when that window lives on the same thread, and is NULL for every
+// cross-process switch. EVENT_SYSTEM_FOREGROUND reports the handle regardless.
+// Shell surfaces can take the foreground (clicking the taskbar, showing the
+// desktop) but have no caret, so pasting into them silently does nothing.
+static BOOL IsShellWindow(HWND hwnd) {
+    WCHAR cls[64] = L"";
+    GetClassNameW(hwnd, cls, 64);
+    return (wcscmp(cls, L"Shell_TrayWnd") == 0 ||
+            wcscmp(cls, L"Progman") == 0 ||
+            wcscmp(cls, L"WorkerW") == 0 ||
+            wcscmp(cls, L"Shell_SecondaryTrayWnd") == 0 ||
+            wcscmp(cls, L"NotifyIconOverflowWindow") == 0 ||
+            wcscmp(cls, L"Windows.UI.Core.CoreWindow") == 0);
+}
+
+static BOOL IsUsablePasteTarget(HWND hwnd) {
+    if (!hwnd || hwnd == g_hMain) return FALSE;
+    if (!IsWindow(hwnd) || !IsWindowVisible(hwnd)) return FALSE;
+    if (IsShellWindow(hwnd)) return FALSE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == GetCurrentProcessId()) return FALSE;   // our own windows, incl. the key dialog
+    return TRUE;
+}
+
+void CALLBACK ForegroundEventProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd,
+                                  LONG idObject, LONG idChild, DWORD eventThread, DWORD eventTime) {
+    (void)hook; (void)event; (void)idChild; (void)eventThread; (void)eventTime;
+    if (idObject != OBJID_WINDOW) return;
+    if (!IsUsablePasteTarget(hwnd)) return;
+
+    g_hLastForegroundWindow = hwnd;
+}
+
+// Fallback for the very first run, before any foreground switch was observed:
+// the topmost visible, unowned, titled top-level window sitting behind ours.
+static HWND FindWindowBehindUs(void) {
+    for (HWND h = GetWindow(g_hMain, GW_HWNDNEXT); h; h = GetWindow(h, GW_HWNDNEXT)) {
+        if (!IsUsablePasteTarget(h)) continue;
+        if (GetWindow(h, GW_OWNER)) continue;
+        if (GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) continue;
+        if (GetWindowTextLengthW(h) == 0) continue;
+        return h;
+    }
+    return NULL;
 }
 
 // ---------- Clipboard ----------
@@ -291,6 +440,222 @@ char* ExtractTextField(const char* json) {
     return out;
 }
 
+// ---------- DeepL language code mapping ----------
+// DeepL target codes want an explicit regional variant for English.
+static const char* DeepLTargetCode(const WCHAR* uiLang) {
+    if (wcscmp(uiLang, L"English") == 0) return "EN-US";
+    if (wcscmp(uiLang, L"Ukrainian") == 0) return "UK";
+    if (wcscmp(uiLang, L"Russian") == 0) return "RU";
+    if (wcscmp(uiLang, L"Spanish") == 0) return "ES";
+    return NULL;
+}
+
+// Returns NULL for "Auto-detect" (the source_lang field is then omitted entirely).
+static const char* DeepLSourceCode(const WCHAR* uiLang) {
+    if (wcscmp(uiLang, L"English") == 0) return "EN";
+    if (wcscmp(uiLang, L"Ukrainian") == 0) return "UK";
+    if (wcscmp(uiLang, L"Russian") == 0) return "RU";
+    if (wcscmp(uiLang, L"Spanish") == 0) return "ES";
+    return NULL;
+}
+
+// Maps a DeepL language code from the response back to the UI language name.
+static const WCHAR* DeepLCodeToName(const char* code) {
+    if (_stricmp(code, "EN") == 0 || _strnicmp(code, "EN-", 3) == 0) return L"English";
+    if (_stricmp(code, "UK") == 0) return L"Ukrainian";
+    if (_stricmp(code, "RU") == 0) return L"Russian";
+    if (_stricmp(code, "ES") == 0 || _strnicmp(code, "ES-", 3) == 0) return L"Spanish";
+    return NULL;
+}
+
+// ---------- Extract a flat "key":"value" string field from JSON ----------
+static BOOL ExtractStringField(const char* json, const char* key, char* out, int outSize) {
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char* p = strstr(json, pattern);
+    if (!p) return FALSE;
+    const char* s = p + strlen(pattern);
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
+    if (*s != ':') return FALSE;
+    s++;
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
+    if (*s != '"') return FALSE;
+    s++;
+    int i = 0;
+    while (*s && *s != '"' && i < outSize - 1) out[i++] = *s++;
+    out[i] = 0;
+    return TRUE;
+}
+
+// ---------- One DeepL HTTP request against a specific host ----------
+// Returns TRUE if a response was received at all; fills *statusOut and a malloc'd *respOut.
+static BOOL DeepLRequest(const WCHAR* host, const WCHAR* key, const char* body,
+                         DWORD* statusOut, char** respOut) {
+    *statusOut = 0;
+    *respOut = NULL;
+    BOOL ok = FALSE;
+
+    HINTERNET hSession = WinHttpOpen(L"PasteTranslate/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (hSession) {
+        HINTERNET hConnect = WinHttpConnect(hSession, host, INTERNET_DEFAULT_HTTPS_PORT, 0);
+        if (hConnect) {
+            HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", L"/v2/translate",
+                NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+            if (hRequest) {
+                WCHAR headers[512];
+                // %ls, not %s: this toolchain's msvcrt swprintf treats %s as char*.
+                swprintf(headers, 512, L"Content-Type: application/json\r\nAuthorization: DeepL-Auth-Key %ls\r\n", key);
+
+                BOOL sent = WinHttpSendRequest(hRequest, headers, (DWORD)-1,
+                    (LPVOID)body, (DWORD)strlen(body), (DWORD)strlen(body), 0);
+                if (sent && WinHttpReceiveResponse(hRequest, NULL)) {
+                    DWORD statusCode = 0, statusSize = sizeof(statusCode);
+                    WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_FLAG_NUMBER | WINHTTP_QUERY_STATUS_CODE,
+                        WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
+
+                    size_t cap = 8192, len = 0;
+                    char* resp = (char*)malloc(cap);
+                    resp[0] = 0;
+                    DWORD dwSize = 0;
+                    do {
+                        dwSize = 0;
+                        if (!WinHttpQueryDataAvailable(hRequest, &dwSize)) break;
+                        if (dwSize == 0) break;
+                        if (len + dwSize + 1 > cap) {
+                            cap = (len + dwSize + 1) * 2;
+                            resp = (char*)realloc(resp, cap);
+                        }
+                        DWORD dwRead = 0;
+                        if (!WinHttpReadData(hRequest, resp + len, dwSize, &dwRead)) break;
+                        len += dwRead;
+                        resp[len] = 0;
+                    } while (dwSize > 0);
+
+                    *statusOut = statusCode;
+                    *respOut = resp;
+                    ok = TRUE;
+                }
+                WinHttpCloseHandle(hRequest);
+            }
+            WinHttpCloseHandle(hConnect);
+        }
+        WinHttpCloseHandle(hSession);
+    }
+    return ok;
+}
+
+// ---------- Call DeepL API ----------
+// Returns a malloc'd wide string shaped exactly like the Gemini path's output
+// ("LANG: ...\nTRANSLATION: ..."), so every UI layer above stays provider-agnostic.
+WCHAR* CallDeepLTranslate(const WCHAR* text, const WCHAR* sourceLang, const WCHAR* targetLang, WCHAR* errOut, int errOutSize) {
+    errOut[0] = 0;
+    if (wcslen(g_deeplKey) == 0) {
+        wcsncpy(errOut, L"DeepL API key not set (tray menu -> Set DeepL API key)", errOutSize - 1);
+        return NULL;
+    }
+
+    const char* tgtCode = DeepLTargetCode(targetLang);
+    if (!tgtCode) {
+        swprintf(errOut, errOutSize, L"DeepL: unsupported target language '%ls'", targetLang);
+        return NULL;
+    }
+    const char* srcCode = DeepLSourceCode(sourceLang);
+
+    char* textUtf8 = WideToUtf8(text);
+    size_t bodyCap = strlen(textUtf8) * 7 + 512;
+    char* body = (char*)malloc(bodyCap);
+    body[0] = 0;
+    strcat(body, "{\"text\":[\"");
+    JsonEscapeAppend(body, textUtf8);
+    strcat(body, "\"],\"target_lang\":\"");
+    strcat(body, tgtCode);
+    strcat(body, "\"");
+    if (srcCode) {
+        strcat(body, ",\"source_lang\":\"");
+        strcat(body, srcCode);
+        strcat(body, "\"");
+    }
+    // preserve_formatting keeps DeepL from "fixing" leading/trailing punctuation and case.
+    strcat(body, ",\"preserve_formatting\":true}");
+    free(textUtf8);
+
+    // Keys issued on the old free tier carry a ":fx" suffix and belong to the api-free
+    // host; everything else belongs to api.deepl.com. DeepL has renamed its plans more
+    // than once, so treat this only as a first guess and retry the other host on 403.
+    size_t keyLen = wcslen(g_deeplKey);
+    BOOL isFreeKey = (keyLen > 3 && wcscmp(g_deeplKey + keyLen - 3, L":fx") == 0);
+    const WCHAR* primaryHost  = isFreeKey ? L"api-free.deepl.com" : L"api.deepl.com";
+    const WCHAR* fallbackHost = isFreeKey ? L"api.deepl.com" : L"api-free.deepl.com";
+
+    DWORD status = 0;
+    char* resp = NULL;
+    BOOL got = DeepLRequest(primaryHost, g_deeplKey, body, &status, &resp);
+    if (got && status == 403) {
+        DWORD altStatus = 0;
+        char* altResp = NULL;
+        if (DeepLRequest(fallbackHost, g_deeplKey, body, &altStatus, &altResp) && altStatus != 403) {
+            free(resp);
+            status = altStatus;
+            resp = altResp;
+        } else {
+            free(altResp);
+        }
+    }
+    free(body);
+
+    if (!got) {
+        wcsncpy(errOut, L"Failed to send request (check your internet connection)", errOutSize - 1);
+        free(resp);
+        return NULL;
+    }
+
+    WCHAR* result = NULL;
+    if (status == 200) {
+        // Response: {"translations":[{"detected_source_language":"EN","text":"..."}]}
+        char* translatedUtf8 = ExtractTextField(resp);
+        if (translatedUtf8) {
+            char detected[16] = "";
+            const WCHAR* langName = NULL;
+            if (ExtractStringField(resp, "detected_source_language", detected, 16)) {
+                langName = DeepLCodeToName(detected);
+            }
+            WCHAR* transW = Utf8ToWide(translatedUtf8);
+            free(translatedUtf8);
+
+            WCHAR langW[64];
+            if (langName) {
+                wcsncpy(langW, langName, 63);
+            } else if (detected[0]) {
+                WCHAR* rawCode = Utf8ToWide(detected);
+                wcsncpy(langW, rawCode, 63);
+                free(rawCode);
+            } else {
+                wcsncpy(langW, sourceLang, 63);
+            }
+            langW[63] = 0;
+
+            size_t outLen = wcslen(transW) + 128;
+            result = (WCHAR*)malloc(outLen * sizeof(WCHAR));
+            swprintf(result, outLen, L"LANG: %ls\nTRANSLATION: %ls", langW, transW);
+            free(transW);
+        } else {
+            wcsncpy(errOut, L"Failed to parse DeepL response", errOutSize - 1);
+        }
+    } else {
+        WCHAR* respW = Utf8ToWide(resp);
+        const WCHAR* hint = L"";
+        if (status == 403) hint = L"\r\n\r\nAuthorization failed. Both DeepL hosts were tried, so the key itself is wrong, expired, or not an API key.";
+        else if (status == 456) hint = L"\r\n\r\nCharacter quota for this plan is exhausted.";
+        else if (status == 429) hint = L"\r\n\r\nToo many requests - wait a moment and retry.";
+        else if (status == 413) hint = L"\r\n\r\nText too large for a single request.";
+        swprintf(errOut, errOutSize, L"DeepL Error (%lu): %ls%ls", status, respW, hint);
+        free(respW);
+    }
+    free(resp);
+    return result;
+}
+
 // ---------- Call Gemini API ----------
 // Returns malloc'd wide string with translation, or NULL on failure. errOut gets error message if any.
 WCHAR* CallGeminiTranslate(const WCHAR* text, const WCHAR* sourceLang, const WCHAR* targetLang, WCHAR* errOut, int errOutSize) {
@@ -393,6 +758,15 @@ WCHAR* CallGeminiTranslate(const WCHAR* text, const WCHAR* sourceLang, const WCH
     return result;
 }
 
+// ---------- Provider dispatch ----------
+WCHAR* CallTranslate(const WCHAR* provider, const WCHAR* text, const WCHAR* sourceLang,
+                     const WCHAR* targetLang, WCHAR* errOut, int errOutSize) {
+    if (wcscmp(provider, L"Gemini") == 0) {
+        return CallGeminiTranslate(text, sourceLang, targetLang, errOut, errOutSize);
+    }
+    return CallDeepLTranslate(text, sourceLang, targetLang, errOut, errOutSize);
+}
+
 // ---------- Get selected language from combos ----------
 void GetLangText(WCHAR* buf, int bufSize) {
     int idx = (int)SendMessageW(g_hCombo, CB_GETCURSEL, 0, 0);
@@ -402,6 +776,18 @@ void GetLangText(WCHAR* buf, int bufSize) {
 void GetSourceLangText(WCHAR* buf, int bufSize) {
     int idx = (int)SendMessageW(g_hSourceCombo, CB_GETCURSEL, 0, 0);
     SendMessageW(g_hSourceCombo, CB_GETLBTEXT, idx, (LPARAM)buf);
+}
+
+// Falls back to the persisted value when the combo does not exist yet.
+void GetProviderText(WCHAR* buf, int bufSize) {
+    buf[0] = 0;
+    int idx = g_hProviderCombo ? (int)SendMessageW(g_hProviderCombo, CB_GETCURSEL, 0, 0) : CB_ERR;
+    if (idx == CB_ERR) {
+        wcsncpy(buf, g_savedProvider, bufSize - 1);
+        buf[bufSize - 1] = 0;
+        return;
+    }
+    SendMessageW(g_hProviderCombo, CB_GETLBTEXT, idx, (LPARAM)buf);
 }
 
 // ---------- Select a combo item by exact/prefix text match (no-op if not found) ----------
@@ -459,6 +845,7 @@ typedef struct {
     WCHAR text[8192];
     WCHAR targetLang[64];
     WCHAR sourceLang[64];
+    WCHAR provider[32];
 } TranslateParams;
 
 typedef struct {
@@ -470,7 +857,7 @@ DWORD WINAPI TranslateThreadProc(LPVOID param) {
     TranslateParams* p = (TranslateParams*)param;
     TranslateResultMsg* res = (TranslateResultMsg*)malloc(sizeof(TranslateResultMsg));
     res->errBuf[0] = 0;
-    res->rawResult = CallGeminiTranslate(p->text, p->sourceLang, p->targetLang, res->errBuf, 4096);
+    res->rawResult = CallTranslate(p->provider, p->text, p->sourceLang, p->targetLang, res->errBuf, 4096);
     PostMessageW(g_hMain, WM_TRANSLATE_DONE, 0, (LPARAM)res);
     free(p);
     return 0;
@@ -510,6 +897,7 @@ void DoTranslate() {
     p->text[8191] = 0;
     GetLangText(p->targetLang, 64);
     GetSourceLangText(p->sourceLang, 64);
+    GetProviderText(p->provider, 32);
 
     // If auto-detecting and the text looks Latin-script (English/Spanish, no Cyrillic),
     // prefer translating into whichever Slavic language (Russian/Ukrainian) was last used.
@@ -587,17 +975,35 @@ void DoReverseTranslate() {
     DoTranslate();
 }
 
-// ---------- Simulate Ctrl+V in whatever window previously had focus ----------
-void AutoPasteToPreviousWindow() {
-    BOOL autoPaste = (SendMessageW(g_hAutoPasteCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
-    if (!autoPaste) return;
-    if (!g_hPrevForegroundWindow || !IsWindow(g_hPrevForegroundWindow)) return;
+// ---------- Hide our window and synthesize Ctrl+V in the target window ----------
+// Hiding first hands focus back before any keystroke is sent, so the paste always
+// lands in the caret position the user was actually looking at.
+// Windows only honours SetForegroundWindow from the process that owns the current
+// foreground window or just handled input. Attaching to the target's input queue
+// first makes the handover reliable even when that is borderline.
+static void ForceForeground(HWND target) {
+    DWORD targetThread = GetWindowThreadProcessId(target, NULL);
+    DWORD thisThread = GetCurrentThreadId();
+    BOOL attached = FALSE;
 
-    HWND target = g_hPrevForegroundWindow;
-    g_hPrevForegroundWindow = NULL;
-
+    if (targetThread && targetThread != thisThread) {
+        attached = AttachThreadInput(thisThread, targetThread, TRUE);
+    }
+    if (IsIconic(target)) ShowWindow(target, SW_RESTORE);
+    BringWindowToTop(target);
     SetForegroundWindow(target);
-    Sleep(60); // give the target window a moment to actually receive focus
+    SetFocus(target);
+    if (attached) {
+        AttachThreadInput(thisThread, targetThread, FALSE);
+    }
+}
+
+static void PasteIntoWindow(HWND target) {
+    if (!target || !IsWindow(target) || target == g_hMain) return;
+
+    ShowWindow(g_hMain, SW_HIDE);
+    ForceForeground(target);
+    Sleep(80); // give the target window a moment to actually receive focus
 
     INPUT inputs[4];
     ZeroMemory(inputs, sizeof(inputs));
@@ -606,8 +1012,42 @@ void AutoPasteToPreviousWindow() {
     inputs[2].type = INPUT_KEYBOARD; inputs[2].ki.wVk = 'V'; inputs[2].ki.dwFlags = KEYEVENTF_KEYUP;
     inputs[3].type = INPUT_KEYBOARD; inputs[3].ki.wVk = VK_CONTROL; inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
     SendInput(4, inputs, sizeof(INPUT));
+}
 
-    ShowWindow(g_hMain, SW_HIDE);
+// ---------- Automatic paste after a hotkey-triggered translation ----------
+void AutoPasteToPreviousWindow() {
+    BOOL autoPaste = (SendMessageW(g_hAutoPasteCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    if (!autoPaste) return;
+    if (!g_hPrevForegroundWindow || !IsWindow(g_hPrevForegroundWindow)) return;
+
+    HWND target = g_hPrevForegroundWindow;
+    g_hPrevForegroundWindow = NULL;
+    PasteIntoWindow(target);
+}
+
+// ---------- Paste button: hide the window, drop the translation at the caret ----------
+void DoManualPaste() {
+    // Make sure the clipboard really holds the translation we are about to paste.
+    // Successful translations are auto-copied already, but the clipboard may have
+    // been overwritten since, and the user may have triggered this without one.
+    WCHAR outputText[8192];
+    GetWindowTextW(g_hOutput, outputText, 8192);
+    if (wcslen(outputText) > 0) {
+        SetClipboardTextW(outputText);
+    }
+
+    HWND target = g_hLastForegroundWindow;
+    if (!IsUsablePasteTarget(target)) {
+        target = FindWindowBehindUs();
+    }
+    if (!target) {
+        SetWindowTextW(g_hStatus, L"No window to paste into");
+        return;
+    }
+
+    // An explicit paste also consumes any pending automatic one.
+    g_hPrevForegroundWindow = NULL;
+    PasteIntoWindow(target);
 }
 
 // ---------- Apply the result of a finished background translation to the UI ----------
@@ -664,6 +1104,7 @@ void ApplyTranslateResult(TranslateResultMsg* res) {
 // ---------- API key dialog: proper window class with real event handling ----------
 BOOL g_apiDlgActive = FALSE;
 HWND g_apiEditCtrl = NULL;
+WCHAR g_apiDlgProvider[32] = L"DeepL";
 
 LRESULT CALLBACK ApiKeyWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
@@ -672,7 +1113,11 @@ LRESULT CALLBACK ApiKeyWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             if (id == IDOK) {
                 WCHAR buf[256];
                 GetWindowTextW(g_apiEditCtrl, buf, 256);
-                SaveApiKey(buf);
+                if (wcscmp(g_apiDlgProvider, L"Gemini") == 0) {
+                    SaveKeyFile(g_configPath, buf, g_apiKey, 256);
+                } else {
+                    SaveKeyFile(g_deeplConfigPath, buf, g_deeplKey, 256);
+                }
                 DestroyWindow(hwnd);
             } else if (id == IDCANCEL) {
                 DestroyWindow(hwnd);
@@ -689,7 +1134,7 @@ LRESULT CALLBACK ApiKeyWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-void ShowApiKeyDialog(HWND parent) {
+void ShowApiKeyDialog(HWND parent, const WCHAR* provider) {
     static BOOL classRegistered = FALSE;
     if (!classRegistered) {
         WNDCLASSW wc = {0};
@@ -702,25 +1147,46 @@ void ShowApiKeyDialog(HWND parent) {
         classRegistered = TRUE;
     }
 
-    HWND hDlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"ApiKeyDlgClass", L"Gemini API Key",
+    BOOL isGemini = (wcscmp(provider, L"Gemini") == 0);
+    wcsncpy(g_apiDlgProvider, provider, 31);
+    g_apiDlgProvider[31] = 0;
+
+    HWND hDlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"ApiKeyDlgClass",
+        isGemini ? L"Gemini API Key" : L"DeepL API Key",
         (WS_POPUP | WS_CAPTION | WS_SYSMENU) & ~WS_MAXIMIZEBOX,
-        300, 300, 440, 160, parent, NULL, GetModuleHandle(NULL), NULL);
+        Scale(300), Scale(300), Scale(480), Scale(180),
+        parent, NULL, GetModuleHandle(NULL), NULL);
 
-    CreateWindowExW(0, L"STATIC", L"Enter API key (aistudio.google.com -> Get API key):",
-        WS_CHILD | WS_VISIBLE, 10, 10, 400, 20, hDlg, NULL, GetModuleHandle(NULL), NULL);
+    // Lay the dialog out against its real client area so the buttons stay inside
+    // the frame and flush with the right edge at any DPI.
+    RECT dcr;
+    GetClientRect(hDlg, &dcr);
+    int dlgW = (int)dcr.right, dlgH = (int)dcr.bottom;
+    int dm = Scale(12), dgap = Scale(8);
+    int hintH = Scale(20), editH = Scale(26), dBtnH = Scale(28), dBtnW = Scale(92);
 
-    g_apiEditCtrl = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", g_apiKey,
+    CreateWindowExW(0, L"STATIC",
+        isGemini ? L"Enter API key (aistudio.google.com -> Get API key):"
+                 : L"Enter API key (deepl.com/pro-api -> Account -> API keys):",
+        WS_CHILD | WS_VISIBLE, dm, dm, dlgW - dm * 2, hintH,
+        hDlg, NULL, GetModuleHandle(NULL), NULL);
+
+    g_apiEditCtrl = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", isGemini ? g_apiKey : g_deeplKey,
         WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
-        10, 40, 400, 24, hDlg, (HMENU)501, GetModuleHandle(NULL), NULL);
+        dm, dm + hintH + Scale(4), dlgW - dm * 2, editH,
+        hDlg, (HMENU)501, GetModuleHandle(NULL), NULL);
 
+    int dBtnY = dlgH - dm - dBtnH;
     HWND hOk = CreateWindowExW(0, L"BUTTON", L"Save",
         WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-        230, 82, 90, 28, hDlg, (HMENU)IDOK, GetModuleHandle(NULL), NULL);
+        dlgW - dm - dBtnW * 2 - dgap, dBtnY, dBtnW, dBtnH,
+        hDlg, (HMENU)IDOK, GetModuleHandle(NULL), NULL);
     HWND hCancel = CreateWindowExW(0, L"BUTTON", L"Cancel",
         WS_CHILD | WS_VISIBLE,
-        330, 82, 80, 28, hDlg, (HMENU)IDCANCEL, GetModuleHandle(NULL), NULL);
+        dlgW - dm - dBtnW, dBtnY, dBtnW, dBtnH,
+        hDlg, (HMENU)IDCANCEL, GetModuleHandle(NULL), NULL);
 
-    HFONT hFont = CreateFontW(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+    HFONT hFont = g_hFont ? g_hFont : CreateFontW(-Scale(16), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
         DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
     SendMessageW(g_apiEditCtrl, WM_SETFONT, (WPARAM)hFont, TRUE);
@@ -745,56 +1211,167 @@ void ShowApiKeyDialog(HWND parent) {
     SetForegroundWindow(parent);
 }
 
-// ---------- Reposition/resize controls to fill the current client area ----------
+// ---------- Reposition/resize every control for the current client area ----------
+// Labels are sized from their measured text, controls are aligned on a shared
+// baseline per row, and the Engine group is right-anchored so it can never run
+// into the checkboxes.
 void LayoutControls(HWND hwnd) {
-    if (!g_hInput || !g_hOutput) return;
+    if (!g_hInput || !g_hOutput || !g_hProviderCombo || !g_hSrcLangLabel || !g_hBtnPaste) return;
+
     RECT rc;
     GetClientRect(hwnd, &rc);
     int W = rc.right - rc.left;
     int H = rc.bottom - rc.top;
-    int margin = 12;
+
+    int margin   = Scale(12);
+    int gap      = Scale(6);   // between a label and the control it describes
+    int groupGap = Scale(16);  // between independent groups on the same row
+    int rowGap   = Scale(10);  // between the two header rows
+    int labelPad = Scale(6);   // slack so a label never clips its own text
     int contentW = W - margin * 2;
-    if (contentW < 200) contentW = 200;
+    if (contentW < Scale(220)) contentW = Scale(220);
 
-    int inputTop = 96;
-    int btn1W = 120, btn2W = 150, btnH = 34, btnGap = 8;
-    int progressH = 6, progressGap1 = 6, progressGap2 = 8;
-    int labelH = 22, labelGap = 4;
-    int bottomMargin = margin;
+    int rowH = ComboClosedHeight(g_hSourceCombo);
+    if (rowH < Scale(22)) rowH = Scale(22);
+    int labelH = rowH;                       // labels fill the row and centre their text
+    int dropH  = Scale(200);                 // drop-down list extent for the combos
 
-    int fixedVert = inputTop + btnGap + btnH + progressGap1 + progressH + progressGap2 + labelH + labelGap + bottomMargin;
+    // ---- Row 1:  Source: [combo]      Target: [combo] ----
+    int row1Y = Scale(12);
+    int srcLabelW = MeasureCaptionWidth(g_hSrcLangLabel) + labelPad;
+    int tgtLabelW = MeasureCaptionWidth(g_hComboLabel) + labelPad;
+    int comboSpace = contentW - srcLabelW - tgtLabelW - gap * 2 - groupGap;
+    int comboW = comboSpace / 2;
+    if (comboW > Scale(190)) comboW = Scale(190);
+    if (comboW < Scale(92)) comboW = Scale(92);
+
+    int x = margin;
+    MoveWindow(g_hSrcLangLabel, x, row1Y, srcLabelW, labelH, TRUE);
+    x += srcLabelW + gap;
+    MoveWindow(g_hSourceCombo, x, row1Y, comboW, dropH, TRUE);
+    x += comboW + groupGap;
+
+    // Right-anchor the Target group so both header rows end on the same edge.
+    int tgtComboX = margin + contentW - comboW;
+    int tgtLabelX = tgtComboX - gap - tgtLabelW;
+    if (tgtLabelX < x) {
+        tgtLabelX = x;
+        tgtComboX = tgtLabelX + tgtLabelW + gap;
+    }
+    MoveWindow(g_hComboLabel, tgtLabelX, row1Y, tgtLabelW, labelH, TRUE);
+    MoveWindow(g_hCombo, tgtComboX, row1Y, comboW, dropH, TRUE);
+
+    // ---- Row 2:  [x] Always on top   [x] Auto paste        Engine: [combo] ----
+    int row2Y = row1Y + rowH + rowGap;
+    int checkGlyphW = Scale(22);  // themed check box plus its gap before the text
+    int cb1W = MeasureCaptionWidth(g_hTopmostCheck) + checkGlyphW;
+    int cb2W = MeasureCaptionWidth(g_hAutoPasteCheck) + checkGlyphW;
+    int engLabelW = MeasureCaptionWidth(g_hProviderLabel) + labelPad;
+    int engComboW = Scale(124);
+
+    x = margin;
+    MoveWindow(g_hTopmostCheck, x, row2Y, cb1W, rowH, TRUE);
+    x += cb1W + groupGap;
+    MoveWindow(g_hAutoPasteCheck, x, row2Y, cb2W, rowH, TRUE);
+    x += cb2W + groupGap;
+    int pasteBtnW = MeasureCaptionWidth(g_hBtnPaste) + Scale(28);
+    MoveWindow(g_hBtnPaste, x, row2Y, pasteBtnW, rowH, TRUE);
+    x += pasteBtnW + groupGap;
+
+    // Right-anchor the Engine group, then push it back only if the row is too narrow.
+    int engComboX = margin + contentW - engComboW;
+    int engLabelX = engComboX - gap - engLabelW;
+    if (engLabelX < x) {
+        engLabelX = x;
+        engComboX = engLabelX + engLabelW + gap;
+        int overflow = (engComboX + engComboW) - (margin + contentW);
+        if (overflow > 0) {
+            engComboW -= overflow;
+            if (engComboW < Scale(84)) engComboW = Scale(84);
+        }
+    }
+    MoveWindow(g_hProviderLabel, engLabelX, row2Y, engLabelW, labelH, TRUE);
+    MoveWindow(g_hProviderCombo, engComboX, row2Y, engComboW, dropH, TRUE);
+
+    // ---- Buttons: width follows the caption so nothing is clipped ----
+    int btnH = Scale(30);
+    int btnGap = Scale(8);
+    int btn1W = MeasureCaptionWidth(g_hBtn) + Scale(36);
+    int btn2W = MeasureCaptionWidth(g_hBtnReverse) + Scale(36);
+
+    // ---- Vertical budget for the two edit boxes ----
+    int textLabelH = Scale(20);
+    int srcTextLabelY = row2Y + rowH + Scale(12);
+    int inputTop = srcTextLabelY + textLabelH + Scale(3);
+    int progressH = Scale(6), progressGap1 = Scale(6), progressGap2 = Scale(8);
+    int labelGap = Scale(3);
+
+    int fixedVert = inputTop + btnGap + btnH + progressGap1 + progressH
+                  + progressGap2 + textLabelH + labelGap + margin;
     int editsTotal = H - fixedVert;
-    if (editsTotal < 120) editsTotal = 120;
+    int minEdit = Scale(56);
+    if (editsTotal < minEdit * 2) editsTotal = minEdit * 2;
     int inputH = editsTotal / 2;
     int outputH = editsTotal - inputH;
-    if (inputH < 60) inputH = 60;
-    if (outputH < 60) outputH = 60;
 
-    MoveWindow(g_hSourceLabel, margin, 70, contentW, labelH, TRUE);
+    MoveWindow(g_hSourceLabel, margin, srcTextLabelY, contentW, textLabelH, TRUE);
     MoveWindow(g_hInput, margin, inputTop, contentW, inputH, TRUE);
 
     int btnY = inputTop + inputH + btnGap;
     MoveWindow(g_hBtn, margin, btnY, btn1W, btnH, TRUE);
-    MoveWindow(g_hBtnReverse, margin + btn1W + 8, btnY, btn2W, btnH, TRUE);
-    int statusX = margin + btn1W + 8 + btn2W + 13;
-    int statusW = contentW - (btn1W + 8 + btn2W + 13);
-    if (statusW < 60) statusW = 60;
-    MoveWindow(g_hStatus, statusX, btnY + (btnH - labelH) / 2, statusW, labelH, TRUE);
+    MoveWindow(g_hBtnReverse, margin + btn1W + btnGap, btnY, btn2W, btnH, TRUE);
+
+    int statusX = margin + btn1W + btnGap + btn2W + Scale(12);
+    int statusW = (margin + contentW) - statusX;
+    if (statusW < Scale(40)) statusW = Scale(40);
+    // Centre the status text against the taller buttons.
+    MoveWindow(g_hStatus, statusX, btnY + (btnH - textLabelH) / 2, statusW, textLabelH, TRUE);
 
     int progressY = btnY + btnH + progressGap1;
     MoveWindow(g_hProgress, margin, progressY, contentW, progressH, TRUE);
 
     int outLabelY = progressY + progressH + progressGap2;
-    MoveWindow(g_hOutputLabel, margin, outLabelY, contentW, labelH, TRUE);
-    int outY = outLabelY + labelH + labelGap;
-    MoveWindow(g_hOutput, margin, outY, contentW, outputH, TRUE);
+    MoveWindow(g_hOutputLabel, margin, outLabelY, contentW, textLabelH, TRUE);
+    MoveWindow(g_hOutput, margin, outLabelY + textLabelH + labelGap, contentW, outputH, TRUE);
+}
+
+// ---------- Smallest window size that still fits every row without overlap ----------
+static void ComputeMinWindowSize(HWND hwnd) {
+    int margin = Scale(12), gap = Scale(6), groupGap = Scale(16), labelPad = Scale(6);
+    int checkGlyphW = Scale(22);
+
+    int row1 = MeasureCaptionWidth(g_hSrcLangLabel) + labelPad + gap + Scale(150)
+             + groupGap
+             + MeasureCaptionWidth(g_hComboLabel) + labelPad + gap + Scale(150);
+
+    int row2 = MeasureCaptionWidth(g_hTopmostCheck) + checkGlyphW + groupGap
+             + MeasureCaptionWidth(g_hAutoPasteCheck) + checkGlyphW + groupGap
+             + MeasureCaptionWidth(g_hBtnPaste) + Scale(28) + groupGap
+             + MeasureCaptionWidth(g_hProviderLabel) + labelPad + gap + Scale(124);
+
+    int row3 = MeasureCaptionWidth(g_hBtn) + Scale(36) + Scale(8)
+             + MeasureCaptionWidth(g_hBtnReverse) + Scale(36) + Scale(12) + Scale(130);
+
+    int widest = row1;
+    if (row2 > widest) widest = row2;
+    if (row3 > widest) widest = row3;
+
+    RECT rc = {0, 0, widest + margin * 2, Scale(420)};
+    AdjustWindowRectEx(&rc, (DWORD)GetWindowLongPtrW(hwnd, GWL_STYLE), FALSE,
+                       (DWORD)GetWindowLongPtrW(hwnd, GWL_EXSTYLE));
+    g_minWinW = (int)(rc.right - rc.left);
+    g_minWinH = (int)(rc.bottom - rc.top);
 }
 
 // ---------- Main window proc ----------
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE: {
-            HWND hSrcLabel = CreateWindowExW(0, L"STATIC", L"Source:", WS_CHILD | WS_VISIBLE,
+            InitDpi(hwnd);
+
+            // Creation coordinates below are placeholders: LayoutControls() positions
+            // and sizes every control from measured text once the font is applied.
+            g_hSrcLangLabel = CreateWindowExW(0, L"STATIC", L"Source:", WS_CHILD | WS_VISIBLE,
                 12, 13, 60, 22, hwnd, NULL, GetModuleHandle(NULL), NULL);
 
             g_hSourceCombo = CreateWindowExW(0, L"COMBOBOX", NULL,
@@ -821,11 +1398,25 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
             g_hTopmostCheck = CreateWindowExW(0, L"BUTTON", L"Always on top",
                 WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                12, 44, 150, 22, hwnd, (HMENU)ID_CHECK_TOPMOST, GetModuleHandle(NULL), NULL);
+                12, 44, 112, 22, hwnd, (HMENU)ID_CHECK_TOPMOST, GetModuleHandle(NULL), NULL);
 
             g_hAutoPasteCheck = CreateWindowExW(0, L"BUTTON", L"Auto paste",
                 WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                180, 44, 150, 22, hwnd, (HMENU)ID_CHECK_AUTOPASTE, GetModuleHandle(NULL), NULL);
+                132, 44, 96, 22, hwnd, (HMENU)ID_CHECK_AUTOPASTE, GetModuleHandle(NULL), NULL);
+
+            g_hBtnPaste = CreateWindowExW(0, L"BUTTON", L"Paste",
+                WS_CHILD | WS_VISIBLE,
+                240, 44, 80, 24, hwnd, (HMENU)ID_BTN_PASTE, GetModuleHandle(NULL), NULL);
+
+            g_hProviderLabel = CreateWindowExW(0, L"STATIC", L"Engine:", WS_CHILD | WS_VISIBLE,
+                240, 47, 54, 22, hwnd, NULL, GetModuleHandle(NULL), NULL);
+
+            g_hProviderCombo = CreateWindowExW(0, L"COMBOBOX", NULL,
+                WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
+                296, 44, 130, 160, hwnd, (HMENU)ID_COMBO_PROVIDER, GetModuleHandle(NULL), NULL);
+            SendMessageW(g_hProviderCombo, CB_ADDSTRING, 0, (LPARAM)L"DeepL");
+            SendMessageW(g_hProviderCombo, CB_ADDSTRING, 0, (LPARAM)L"Gemini");
+            SendMessageW(g_hProviderCombo, CB_SETCURSEL, 0, 0);
 
             g_hSourceLabel = CreateWindowExW(0, L"STATIC", L"Source text:", WS_CHILD | WS_VISIBLE,
                 12, 70, 200, 22, hwnd, NULL, GetModuleHandle(NULL), NULL);
@@ -857,12 +1448,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
                 12, 316, 500, 110, hwnd, (HMENU)ID_EDIT_OUTPUT, GetModuleHandle(NULL), NULL);
 
-            HFONT hFont = CreateFontW(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            g_hFont = CreateFontW(-Scale(16), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                 DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                 DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-            HWND children[] = {hSrcLabel, g_hSourceCombo, g_hComboLabel, g_hCombo, g_hTopmostCheck, g_hAutoPasteCheck,
-                                g_hSourceLabel, g_hInput, g_hBtn, g_hBtnReverse, g_hStatus, g_hOutputLabel, g_hOutput};
-            for (int i = 0; i < 13; i++) SendMessageW(children[i], WM_SETFONT, (WPARAM)hFont, TRUE);
+            HWND children[] = {g_hSrcLangLabel, g_hSourceCombo, g_hComboLabel, g_hCombo,
+                                g_hTopmostCheck, g_hAutoPasteCheck, g_hBtnPaste,
+                                g_hProviderLabel, g_hProviderCombo,
+                                g_hSourceLabel, g_hInput, g_hBtn, g_hBtnReverse, g_hStatus,
+                                g_hOutputLabel, g_hOutput};
+            for (int i = 0; i < (int)(sizeof(children) / sizeof(children[0])); i++) {
+                SendMessageW(children[i], WM_SETFONT, (WPARAM)g_hFont, TRUE);
+            }
 
             // Tray icon
             memset(&g_nid, 0, sizeof(g_nid));
@@ -875,9 +1471,24 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             wcscpy(g_nid.szTip, L"PasteTranslate (Ctrl+C twice)");
             Shell_NotifyIconW(NIM_ADD, &g_nid);
 
+            // Text metrics are known only now that the font is applied.
+            ComputeMinWindowSize(hwnd);
+            {
+                RECT wr;
+                GetWindowRect(hwnd, &wr);
+                int w = (int)(wr.right - wr.left);
+                int h = (int)(wr.bottom - wr.top);
+                if (w < g_minWinW || h < g_minWinH) {
+                    SetWindowPos(hwnd, NULL, 0, 0,
+                                 w < g_minWinW ? g_minWinW : w,
+                                 h < g_minWinH ? g_minWinH : h,
+                                 SWP_NOMOVE | SWP_NOZORDER);
+                }
+            }
             LayoutControls(hwnd);
 
             // Restore persisted UI state
+            SetComboSelectionByText(g_hProviderCombo, g_savedProvider);
             SetComboSelectionByText(g_hSourceCombo, g_savedSourceLang);
             SetComboSelectionByText(g_hCombo, g_savedTargetLang);
             if (g_savedAlwaysOnTop) {
@@ -895,10 +1506,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             break;
         }
+        case WM_ACTIVATE: {
+            // Secondary source only: lParam holds the deactivated window's handle
+            // just for same-thread switches, and is NULL across processes, which is
+            // why ForegroundEventProc above does the real tracking.
+            if (LOWORD(wParam) != WA_INACTIVE) {
+                HWND prev = (HWND)lParam;
+                if (prev && prev != hwnd && IsWindow(prev)) {
+                    g_hLastForegroundWindow = prev;
+                }
+            }
+            break;
+        }
         case WM_GETMINMAXINFO: {
             MINMAXINFO* mmi = (MINMAXINFO*)lParam;
-            mmi->ptMinTrackSize.x = 540;
-            mmi->ptMinTrackSize.y = 440;
+            mmi->ptMinTrackSize.x = g_minWinW;
+            mmi->ptMinTrackSize.y = g_minWinH;
             break;
         }
         case WM_COMMAND: {
@@ -910,6 +1533,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             } else if (ctrlId == ID_BTN_REVERSE) {
                 g_hPrevForegroundWindow = NULL;
                 DoReverseTranslate();
+            } else if (ctrlId == ID_BTN_PASTE) {
+                DoManualPaste();
             } else if (ctrlId == ID_CHECK_TOPMOST) {
                 BOOL checked = (SendMessageW(g_hTopmostCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
                 SetWindowPos(hwnd, checked ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
@@ -921,11 +1546,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 WCHAR sel[64];
                 GetSourceLangText(sel, 64);
                 if (wcscmp(sel, L"Russian") == 0 || wcscmp(sel, L"Ukrainian") == 0) wcscpy(g_lastSlavicLang, sel);
+            } else if (ctrlId == ID_COMBO_PROVIDER && notifyCode == CBN_SELCHANGE) {
+                // Switching to a provider with no key yet: ask for it right away.
+                WCHAR provider[32];
+                GetProviderText(provider, 32);
+                if (wcscmp(provider, L"Gemini") == 0 && wcslen(g_apiKey) == 0) {
+                    ShowApiKeyDialog(hwnd, L"Gemini");
+                } else if (wcscmp(provider, L"DeepL") == 0 && wcslen(g_deeplKey) == 0) {
+                    ShowApiKeyDialog(hwnd, L"DeepL");
+                }
             } else if (ctrlId == ID_TRAY_OPEN) {
                 ShowWindow(hwnd, SW_SHOW);
                 SetForegroundWindow(hwnd);
             } else if (ctrlId == ID_TRAY_KEY) {
-                ShowApiKeyDialog(hwnd);
+                ShowApiKeyDialog(hwnd, L"DeepL");
+            } else if (ctrlId == ID_TRAY_KEY_GEMINI) {
+                ShowApiKeyDialog(hwnd, L"Gemini");
             } else if (ctrlId == ID_TRAY_EXIT) {
                 DestroyWindow(hwnd);
             }
@@ -940,7 +1576,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 GetCursorPos(&pt);
                 HMENU hMenu = CreatePopupMenu();
                 AppendMenuW(hMenu, MF_STRING, ID_TRAY_OPEN, L"Open PasteTranslate");
-                AppendMenuW(hMenu, MF_STRING, ID_TRAY_KEY, L"Set API key");
+                AppendMenuW(hMenu, MF_STRING, ID_TRAY_KEY, L"Set DeepL API key");
+                AppendMenuW(hMenu, MF_STRING, ID_TRAY_KEY_GEMINI, L"Set Gemini API key");
                 AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
                 AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"Exit");
                 SetForegroundWindow(hwnd);
@@ -983,6 +1620,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SaveSettings(hwnd);
             Shell_NotifyIconW(NIM_DELETE, &g_nid);
             if (g_hKeyboardHook) UnhookWindowsHookEx(g_hKeyboardHook);
+            if (g_hForegroundHook) UnhookWinEvent(g_hForegroundHook);
             PostQuitMessage(0);
             break;
         default:
@@ -1038,13 +1676,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     WCHAR* lastSlash = wcsrchr(g_exeDir, L'\\');
     if (lastSlash) *(lastSlash + 1) = 0;
     swprintf(g_configPath, MAX_PATH, L"%lstranslator_config.txt", g_exeDir);
+    swprintf(g_deeplConfigPath, MAX_PATH, L"%lsdeepl_config.txt", g_exeDir);
     swprintf(g_settingsPath, MAX_PATH, L"%lspastetranslate_settings.ini", g_exeDir);
-    LoadApiKey();
+    LoadApiKeys();
     LoadSettings();
 
-    // Sanity-clamp restored window geometry in case of a corrupted file or a changed display setup
-    if (g_savedWinW < 540 || g_savedWinW > 3000) g_savedWinW = 600;
-    if (g_savedWinH < 440 || g_savedWinH > 3000) g_savedWinH = 520;
+    // Sanity-clamp restored window geometry in case of a corrupted file or a changed
+    // display setup. WM_CREATE grows the window afterwards if the real DPI needs more.
+    if (g_savedWinW < 400 || g_savedWinW > 6000) g_savedWinW = 620;
+    if (g_savedWinH < 360 || g_savedWinH > 6000) g_savedWinH = 540;
     if (g_savedWinX != CW_USEDEFAULT && (g_savedWinX < -100 || g_savedWinX > 10000)) g_savedWinX = CW_USEDEFAULT;
     if (g_savedWinY != CW_USEDEFAULT && (g_savedWinY < -100 || g_savedWinY > 10000)) g_savedWinY = CW_USEDEFAULT;
 
@@ -1062,12 +1702,25 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         g_savedWinX, g_savedWinY, g_savedWinW, g_savedWinH,
         NULL, NULL, hInstance, NULL);
 
-    if (wcslen(g_apiKey) == 0) {
-        ShowWindow(g_hMain, SW_SHOW);
-        ShowApiKeyDialog(g_hMain);
+    // Only prompt for the key of the provider that is actually selected.
+    {
+        BOOL geminiSelected = (wcscmp(g_savedProvider, L"Gemini") == 0);
+        const WCHAR* missingFor = NULL;
+        if (geminiSelected && wcslen(g_apiKey) == 0) missingFor = L"Gemini";
+        else if (!geminiSelected && wcslen(g_deeplKey) == 0) missingFor = L"DeepL";
+        if (missingFor) {
+            ShowWindow(g_hMain, SW_SHOW);
+            ShowApiKeyDialog(g_hMain, missingFor);
+        }
     }
 
     g_hKeyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, hInstance, 0);
+
+    // WINEVENT_OUTOFCONTEXT delivers through this thread's message loop, so no DLL
+    // injection is needed; SKIPOWNPROCESS keeps our own windows out of the results.
+    g_hForegroundHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+        NULL, ForegroundEventProc, 0, 0,
+        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {
