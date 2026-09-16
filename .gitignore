@@ -3,9 +3,12 @@
 *.exe
 *.ico
 icon_preview.png
+layout_*.png
+test_deepl
 
 # Runtime files created next to the exe (contain the user's API key / local settings)
 translator_config.txt
+deepl_config.txt
 pastetranslate_settings.ini
 
 # Misc
