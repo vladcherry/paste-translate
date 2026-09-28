@@ -9,6 +9,17 @@ Gemini** — pick one in the window, the choice is remembered.
 Single self-contained `.exe`, no installer, no runtime, no dependencies
 beyond standard Windows system DLLs.
 
+Current release: **1.1.0**.
+
+<p align="center">
+  <a href="https://github.com/vladcherry/paste-translate/releases/latest/download/PasteTranslate.exe"><b>⬇ Download PasteTranslate.exe</b></a>
+  &nbsp;·&nbsp;
+  <a href="https://github.com/vladcherry/paste-translate/releases/latest">Latest release</a>
+</p>
+
+Download the exe, put it anywhere, and run it. On first launch it asks for
+the API key of the selected engine — DeepL by default (see below).
+
 ## Features
 
 - **Global hotkey — double Ctrl+C.** A low-level keyboard hook detects two
@@ -108,44 +119,56 @@ All three files are plain text, created next to the exe on first use:
 
 ## Building from source
 
-You need [MinGW-w64](https://www.mingw-w64.org/) (a GCC cross/native
-toolchain that can target Windows) and Python 3 with
-[Pillow](https://pypi.org/project/Pillow/) to (re)generate the icon.
+### On Windows (MSVC) — what CI uses
 
-### On Linux (cross-compiling)
+Install [Build Tools for Visual Studio](https://visualstudio.microsoft.com/downloads/)
+with the **Desktop development with C++** workload, plus Python 3 with
+[Pillow](https://pypi.org/project/Pillow/) for the icon, then run:
+
+```bat
+pip install Pillow
+build.bat
+```
+
+`build.bat` finds MSVC through `vswhere` on its own (no Developer Command
+Prompt needed), generates `icon.ico`, compiles the resources, and links
+`build\PasteTranslate.exe`.
+
+### With MinGW-w64
+
+[MinGW-w64](https://www.mingw-w64.org/) works too, natively or
+cross-compiling from Linux:
 
 ```bash
-sudo apt-get install -y mingw-w64
+sudo apt-get install -y mingw-w64   # or: pacman -S mingw-w64-x86_64-gcc  (MSYS2)
 pip install Pillow
 
-# 1. Generate icon.ico
 python3 gen_icon.py
-
-# 2. Compile the resources (icon + manifest)
 x86_64-w64-mingw32-windres translator.rc -O coff -o translator_res.o
-
-# 3. Compile and link the app
 x86_64-w64-mingw32-gcc -municode -mwindows translator.c translator_res.o \
     -o PasteTranslate.exe -lwinhttp -lshell32 -lcomctl32
 ```
 
-### On Windows (native)
+On Windows under an **MSYS2 MinGW64** shell, drop the `x86_64-w64-mingw32-`
+prefixes.
 
-Install [MSYS2](https://www.msys2.org/), then from an **MSYS2 MinGW64**
-shell:
+The result either way is a single ~210 KB `PasteTranslate.exe` — no other
+files are required to run it (settings/config files are created next to it
+on first use).
+
+## Releases
+
+Pushing a `v*` tag builds on `windows-latest` and publishes a release with
+`PasteTranslate.exe` attached — see
+[.github/workflows/build.yml](.github/workflows/build.yml):
 
 ```bash
-pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-python-pillow
-
-python gen_icon.py
-windres translator.rc -O coff -o translator_res.o
-gcc -municode -mwindows translator.c translator_res.o \
-    -o PasteTranslate.exe -lwinhttp -lshell32 -lcomctl32
+git tag v1.1.0
+git push origin v1.1.0
 ```
 
-The result is a single ~150 KB `PasteTranslate.exe` — no other files are
-required to run it (settings/config files are created next to it on
-first use).
+Every push to `main` and every pull request is built the same way, with the
+exe kept as a workflow artifact.
 
 ## Project layout
 
@@ -155,6 +178,7 @@ first use).
 | `translator.rc` | Resource script — embeds the icon and the manifest |
 | `app.manifest` | Enables Common Controls v6 (modern visual styles) + DPI awareness |
 | `gen_icon.py` | Generates `icon.ico` (Pillow) |
+| `build.bat` | MSVC build script (used by CI and locally) |
 | `test_deepl.c` | Host-side test of the DeepL request body and response parsing |
 | `layout_check.py` | Mirrors the window layout arithmetic: checks that no control overlaps or escapes the client area at 96–192 dpi |
 
